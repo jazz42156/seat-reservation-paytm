@@ -70,6 +70,22 @@ class ShowResponse(BaseModel):
     seats: list[SeatResponse]
 
 
+class ShowCounts(BaseModel):
+    total: int
+    available: int
+    held: int
+    confirmed: int
+
+
+class ShowStateResponse(BaseModel):
+    id: UUID
+    name: str
+    price_paise: int
+    per_user_limit: int
+    seats: list[SeatResponse]
+    counts: ShowCounts
+
+
 @router.get("/health/live")
 async def health_live() -> dict[str, str]:
     return {"status": "alive"}
@@ -109,6 +125,65 @@ async def create_show(
         seats=[
             SeatResponse(seat_label=label, status="available") for label in payload.seats
         ],
+    )
+
+
+@router.get("/shows/{show_id}", response_model=ShowStateResponse)
+async def get_show(show_id: str) -> ShowStateResponse:
+    try:
+        parsed_show_id = UUID(show_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": "show not found"},
+        ) from None
+
+    pool = get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            """
+            SELECT
+                shows.id,
+                shows.name,
+                shows.price_paise,
+                shows.per_user_limit,
+                seats.seat_label,
+                seats.status
+            FROM shows
+            LEFT JOIN seats ON seats.show_id = shows.id
+            WHERE shows.id = $1
+            ORDER BY seats.seat_label
+            """,
+            parsed_show_id,
+        )
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": "show not found"},
+        )
+
+    seats = [
+        SeatResponse(seat_label=row["seat_label"], status=row["status"])
+        for row in rows
+        if row["seat_label"] is not None
+    ]
+    available = sum(1 for seat in seats if seat.status == "available")
+    held = sum(1 for seat in seats if seat.status == "held")
+    confirmed = sum(1 for seat in seats if seat.status == "confirmed")
+    total = available + held + confirmed
+    show = rows[0]
+    return ShowStateResponse(
+        id=show["id"],
+        name=show["name"],
+        price_paise=show["price_paise"],
+        per_user_limit=show["per_user_limit"],
+        seats=seats,
+        counts=ShowCounts(
+            total=total,
+            available=available,
+            held=held,
+            confirmed=confirmed,
+        ),
     )
 
 
