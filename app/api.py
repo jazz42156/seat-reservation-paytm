@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from app.auth import issue_user_token, require_admin, require_user
+from app.cancel import cancel_seats
 from app.db import get_pool
 from app.reserve import reserve_seats
 
@@ -267,6 +268,22 @@ async def reserve_show(
     )
     headers = {"Idempotent-Replay": "true"} if outcome.replay else None
     return JSONResponse(status_code=outcome.status_code, content=outcome.body, headers=headers)
+
+
+@router.post("/reservations/{reservation_id}/cancel")
+async def cancel_reservation(
+    reservation_id: str,
+    user_id: Annotated[str, Depends(require_user)],
+) -> JSONResponse:
+    try:
+        parsed_reservation_id = UUID(reservation_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": "reservation not found"},
+        ) from None
+    outcome = await cancel_seats(reservation_id=parsed_reservation_id, user_id=user_id)
+    return JSONResponse(status_code=outcome.status_code, content=outcome.body)
 
 
 async def _read_show(request: Request) -> CreateShowRequest:
