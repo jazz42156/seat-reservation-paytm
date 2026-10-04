@@ -1,16 +1,19 @@
 import json
-from typing import Annotated
+from typing import Annotated, TypeVar
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
-from app.auth import require_admin
+from app.auth import issue_user_token, require_admin, require_user
 from app.db import get_pool
+from app.reserve import reserve_seats
 
 router = APIRouter()
 
 _MAX_PAISE = 2**63 - 1
+T = TypeVar("T", bound=BaseModel)
 
 
 class CreateShowRequest(BaseModel):
@@ -109,7 +112,93 @@ async def create_show(
     )
 
 
+class TokenRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    user_id: str
+
+
+class TokenResponse(BaseModel):
+    token: str
+    token_type: str
+    user_id: str
+
+
+class ReserveRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    seats: list[str]
+
+    @field_validator("seats")
+    @classmethod
+    def seats_must_be_unique_names(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for seat in value:
+            label = seat.strip()
+            if not label:
+                raise ValueError("must not contain an empty seat name")
+            if label in seen:
+                raise ValueError("must not contain duplicate seat names")
+            seen.add(label)
+            cleaned.append(label)
+        if not cleaned:
+            raise ValueError("must not be empty")
+        return cleaned
+
+
+@router.post("/auth/token", status_code=201, response_model=TokenResponse)
+async def create_token(request: Request) -> TokenResponse:
+    payload = await _read_model(request, TokenRequest)
+    try:
+        token = issue_user_token(payload.user_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": str(exc)},
+        ) from None
+    return TokenResponse(token=token, token_type="Bearer", user_id=payload.user_id)
+
+
+@router.post("/shows/{show_id}/reserve")
+async def reserve_show(
+    show_id: str,
+    request: Request,
+    user_id: Annotated[str, Depends(require_user)],
+    idempotency_key: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    key = (idempotency_key or "").strip()
+    if not key or len(key) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_request",
+                "message": "Idempotency-Key header is required",
+            },
+        )
+    try:
+        parsed_show_id = UUID(show_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": "show not found"},
+        ) from None
+    payload = await _read_model(request, ReserveRequest)
+    outcome = await reserve_seats(
+        show_id=parsed_show_id,
+        user_id=user_id,
+        seats=payload.seats,
+        idempotency_key=key,
+    )
+    headers = {"Idempotent-Replay": "true"} if outcome.replay else None
+    return JSONResponse(status_code=outcome.status_code, content=outcome.body, headers=headers)
+
+
 async def _read_show(request: Request) -> CreateShowRequest:
+    return await _read_model(request, CreateShowRequest)
+
+
+async def _read_model(request: Request, model: type[T]) -> T:
     raw = await request.body()
     if not raw:
         raise HTTPException(
@@ -129,7 +218,7 @@ async def _read_show(request: Request) -> CreateShowRequest:
             detail={"error": "invalid_request", "message": "request body must be a JSON object"},
         )
     try:
-        return CreateShowRequest.model_validate(body)
+        return model.model_validate(body)
     except ValidationError as exc:
         error = exc.errors()[0]
         field = ".".join(str(part) for part in error["loc"])
