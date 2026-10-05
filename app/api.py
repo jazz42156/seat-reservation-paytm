@@ -3,18 +3,37 @@ from typing import Annotated, TypeVar
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from app.auth import issue_user_token, require_admin, require_user
 from app.cancel import cancel_seats
 from app.db import get_pool
-from app.reserve import reserve_seats
+from app.metrics import (
+    refresh_seats_available,
+    reservations_confirmed_total,
+    reservations_declined_total,
+)
+from app.reserve import ReserveOutcome, reserve_seats
 
 router = APIRouter()
 
 _MAX_PAISE = 2**63 - 1
 T = TypeVar("T", bound=BaseModel)
+
+
+def _json_request_body(model: type[BaseModel]) -> dict[str, object]:
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": model.model_json_schema(),
+                }
+            },
+        }
+    }
 
 
 class CreateShowRequest(BaseModel):
@@ -92,7 +111,31 @@ async def health_live() -> dict[str, str]:
     return {"status": "alive"}
 
 
-@router.post("/shows", status_code=201, response_model=ShowResponse)
+@router.get("/health/ready")
+async def health_ready() -> JSONResponse:
+    try:
+        pool = get_pool()
+        async with pool.acquire() as connection:
+            answer = await connection.fetchval("SELECT 1")
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    if answer != 1:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    return JSONResponse(status_code=200, content={"status": "ready"})
+
+
+@router.get("/metrics")
+async def metrics() -> Response:
+    await refresh_seats_available()
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@router.post(
+    "/shows",
+    status_code=201,
+    response_model=ShowResponse,
+    openapi_extra=_json_request_body(CreateShowRequest),
+)
 async def create_show(
     request: Request,
     _: Annotated[None, Depends(require_admin)],
@@ -223,7 +266,12 @@ class ReserveRequest(BaseModel):
         return cleaned
 
 
-@router.post("/auth/token", status_code=201, response_model=TokenResponse)
+@router.post(
+    "/auth/token",
+    status_code=201,
+    response_model=TokenResponse,
+    openapi_extra=_json_request_body(TokenRequest),
+)
 async def create_token(request: Request) -> TokenResponse:
     payload = await _read_model(request, TokenRequest)
     try:
@@ -236,13 +284,17 @@ async def create_token(request: Request) -> TokenResponse:
     return TokenResponse(token=token, token_type="Bearer", user_id=payload.user_id)
 
 
-@router.post("/shows/{show_id}/reserve")
+@router.post(
+    "/shows/{show_id}/reserve",
+    openapi_extra=_json_request_body(ReserveRequest),
+)
 async def reserve_show(
     show_id: str,
     request: Request,
     user_id: Annotated[str, Depends(require_user)],
     idempotency_key: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
+    request.state.user_id = user_id
     key = (idempotency_key or "").strip()
     if not key or len(key) > 200:
         raise HTTPException(
@@ -266,6 +318,8 @@ async def reserve_show(
         seats=payload.seats,
         idempotency_key=key,
     )
+    _record_reserve_metrics(outcome)
+    _remember_result(request, outcome.body)
     headers = {"Idempotent-Replay": "true"} if outcome.replay else None
     return JSONResponse(status_code=outcome.status_code, content=outcome.body, headers=headers)
 
@@ -273,8 +327,10 @@ async def reserve_show(
 @router.post("/reservations/{reservation_id}/cancel")
 async def cancel_reservation(
     reservation_id: str,
+    request: Request,
     user_id: Annotated[str, Depends(require_user)],
 ) -> JSONResponse:
+    request.state.user_id = user_id
     try:
         parsed_reservation_id = UUID(reservation_id)
     except ValueError:
@@ -283,7 +339,34 @@ async def cancel_reservation(
             detail={"error": "not_found", "message": "reservation not found"},
         ) from None
     outcome = await cancel_seats(reservation_id=parsed_reservation_id, user_id=user_id)
+    _remember_result(request, outcome.body)
     return JSONResponse(status_code=outcome.status_code, content=outcome.body)
+
+
+def _remember_result(request: Request, body: dict) -> None:
+    reservation_id = body.get("reservation_id")
+    if isinstance(reservation_id, str) and reservation_id:
+        request.state.reservation_id = reservation_id
+    show_id = body.get("show_id")
+    if isinstance(show_id, str) and show_id:
+        request.state.show_id = show_id
+    outcome = body.get("error") if isinstance(body.get("error"), str) else body.get("status")
+    if isinstance(outcome, str) and outcome:
+        request.state.outcome = outcome
+
+
+def _record_reserve_metrics(outcome: ReserveOutcome) -> None:
+    if outcome.replay:
+        reservations_declined_total.labels(reason="idempotent_replay").inc()
+        return
+    if outcome.status_code == 201:
+        reservations_confirmed_total.inc()
+        return
+    error = outcome.body.get("error")
+    if error == "seat_taken":
+        reservations_declined_total.labels(reason="seat_taken").inc()
+    elif error == "per_user_limit":
+        reservations_declined_total.labels(reason="per_user_limit").inc()
 
 
 async def _read_show(request: Request) -> CreateShowRequest:
