@@ -262,7 +262,7 @@ The idempotency row is kept. Replaying the original reserve key returns the same
 
 ## Local setup
 
-Clean-checkout verification: TODO.
+Clean-checkout verification: verified. A fresh clone was started with `docker compose up --build -d` against an empty PostgreSQL instance. The application initialized the schema automatically, `/health/live` and `/health/ready` both returned 200, and the default burst completed with Overall: PASS.
 
 The app reads environment variables from the process. It does not load a `.env` file. Compose injects the values below.
 
