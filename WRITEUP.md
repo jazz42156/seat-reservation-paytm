@@ -125,6 +125,7 @@ Implemented now:
 - `X-Request-ID` is taken from the caller when the header matches the allowed pattern, otherwise generated, then returned on the response and written on the log line.
 - `GET /health/ready` for Postgres reachability, separate from liveness.
 - The burst tool samples `GET /shows/{id}` during a run and checks `available + held + confirmed == total`.
+- Structured deployment logs were verified in the Railway dashboard after the public burst. There is no public log URL. `request.completed` lines included timestamp, request id, method, path, status, duration, show id, user id, reservation id when the handler had one, and outcome. Live lines included `confirmed`, `seat_taken`, `idempotency_mismatch`, and other `409` reservation declines. The lines did not include `Authorization` headers, bearer tokens, `Idempotency-Key` values, or request bodies.
 
 Proposed alerts, not wired up in this repo:
 
@@ -139,7 +140,7 @@ At 2am the request id joins the access log to one reservation attempt. Readiness
 
 ## 11. Load-test results
 
-Verified:
+Local:
 
 | Run | Result |
 | --- | --- |
@@ -154,27 +155,42 @@ Command:
 python burst/burst.py http://localhost:8000 --requests 20000 --concurrency 500 --setup-concurrency 25
 ```
 
-That local run sent 20,000 mixed reservation attempts. The application side stayed correct: 0 server-side `5xx`, 0 timeouts, 0 reconciliation failures, the final seat invariant held, and the per-user limit and idempotency checks stayed correct. The harness still failed because of 4 client-side `httpx.ReadError` transport failures. Server logs showed 19,996 reserve requests reached the application. The other 4 never reached FastAPI and produced no application exception. This is a local Windows + Docker Desktop transport limit, not an application error response.
+That local run sent 20,000 mixed reservation attempts with concurrency 500. That is 20,000 attempts and at most 500 in flight, not 20,000 simultaneous requests, and it was not run on Railway. The application side stayed correct: 0 server-side `5xx`, 0 timeouts, 0 reconciliation failures, the final seat invariant held, and the per-user limit and idempotency checks stayed correct. The harness still failed because of 4 client-side `httpx.ReadError` transport failures. Server logs showed 19,996 reserve requests reached the application. The four failures occurred at the client/transport layer before reaching FastAPI and were observed on the local Windows + Docker Desktop networking path. They were not application error responses.
 
-Pending:
+Public Railway results use https://seat-reservation-paytm-production.up.railway.app. The service is one replica. Postgres is Railway PostgreSQL via `DATABASE_URL`. The empty database was initialized by the startup migration. Railway's healthcheck is `GET /health/ready`. Before the bursts, `GET /health/live` and `GET /health/ready` returned 200, and `GET /metrics` returned Prometheus text. A smoke show named "Railway smoke test" (seats `A1`, `A2`, `A3`, `price_paise` 25000) reserved `A1` for `smoke-user` and then reported total 3, available 2, held 0, confirmed 1. Metrics after that reservation showed `reservations_confirmed_total` 1 and `seats_available` 2 for that show.
+
+The mixed command also runs the hot-seat, per-user, replay, and mismatch probes before the mixed workload. Those probes are not part of the 2,000 mixed request count. Metric deltas from that command include the probes and the mixed section, so they should not be compared with the mixed counts alone.
 
 | Run | Result |
 | --- | --- |
-| Burst against the public deployment | TODO. No public URL yet. |
+| Public default burst | PASS. Hot seat 1 confirmed and 19 `seat_taken`. Per-user 4 confirmed and 6 `per_user_limit`. Replay and mismatch true. 0 `5xx`, 0 transport errors. Reconciliation failures 0, invariant held. |
+| Public 500 users, one seat, concurrency 500 | PASS. 1 confirmed, 499 `seat_taken`, 0 `5xx`, 0 transport errors. Per-user probe 4 confirmed and 6 `per_user_limit`. Replay and mismatch true. Reconciliation failures 0, invariant held. |
+| Public 2,000 mixed attempts, concurrency 200 | PASS. Mixed section: 1,398 confirmed, 100 replay, 396 `seat_taken`, 6 `per_user_limit`, 100 `idempotency_mismatch`, 0 other 4xx, 0 `5xx`, 0 timeouts, 0 transport errors, 66.535 seconds, 30.1 requests per second. Reconciliation: 17 samples, 0 failures, total 1,506, available 107, held 0, confirmed 1,399, invariant held. |
+
+Commands:
+
+```bash
+python burst/burst.py https://seat-reservation-paytm-production.up.railway.app
+python burst/burst.py https://seat-reservation-paytm-production.up.railway.app --hot-seat 500 --concurrency 500
+python burst/burst.py https://seat-reservation-paytm-production.up.railway.app --requests 2000 --concurrency 200
+```
 
 ## 12. AI usage
 
-AI was directed to inspect the requirements, propose edge cases, help generate and review tests, help build and review the burst harness, analyze failures, and help draft this documentation.
+AI was directed to inspect the requirements, propose edge cases, help draft and review tests, help build and review the burst tooling, analyze failures, and help draft and review this documentation.
 
-Engineering decisions were made and validated around PostgreSQL as the source of truth, deterministic seat locking, the conditional seat update, all-or-nothing multi-seat behavior, explicit cancellation instead of expiry, database-backed idempotency, per-user limit enforcement, and the observability scope.
+Engineering decisions included PostgreSQL as the source of truth, database-backed idempotency, deterministic seat locking, the conditional seat update, all-or-nothing multi-seat reservation, explicit cancellation, the per-user limit mechanism, and the observability scope.
 
-AI-generated suggestions were checked with automated tests, manual HTTP checks, and the concurrency and burst runs. The public-deployment burst has not been run.
+AI suggestions were checked with automated tests, manual HTTP calls, the clean-checkout run, local concurrency runs, and the public Railway bursts.
 
 ## 13. What I would do next
 
-- Deploy the existing container and Postgres, set `DATABASE_URL`, `AUTH_SECRET`, and `ADMIN_TOKEN`, and record the public URL.
-- Size the pool and Postgres from the local 20,000-request run. Application correctness held; the four lost requests were client transport failures on Windows + Docker Desktop.
-- Add a longer Locust (or equivalent) run after the correctness burst, aimed at sustained throughput rather than a single invariant check.
-- Put the existing metrics and readiness check on a dashboard and add the alerts in section 10.
-- Repeat the hot-seat and mixed bursts with more than one API process.
+The public service is already running. None of the following is required to meet this assignment.
+
+- Run a larger hosted load test than the public 500-user and 2,000-request bursts.
+- Tune the pool and Postgres from measured lock-wait and pool-wait time. The local 20,000-attempt run showed application correctness held while four client transport errors failed the harness.
+- Add PgBouncer if more than one API replica would otherwise open too many Postgres sessions.
+- Replace the one-shot startup schema apply with versioned production migrations.
+- Wire the section 10 alerts to a dashboard.
+- Shard by `show_id` only if one database can no longer take the write rate. A reservation does not cross shows.
 - Add payments only if the scope grows. Reservation idempotency would stay in Postgres; a payment would need its own idempotency story.

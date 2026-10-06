@@ -4,6 +4,10 @@ Concurrency-safe assigned-seat reservation API for the Paytm Money Backend Engin
 
 A seat is confirmed in one PostgreSQL transaction. The database decides who gets it. There is no Redis, Kafka, or ORM.
 
+Live service: https://seat-reservation-paytm-production.up.railway.app
+
+`GET /health/live`, `GET /health/ready`, and `GET /metrics` are on that origin. The live burst commands and the Railway log note are in [Deployment](#deployment).
+
 ## Tech stack
 
 | Piece | Version in this repo |
@@ -262,7 +266,7 @@ The idempotency row is kept. Replaying the original reserve key returns the same
 
 ## Local setup
 
-Clean-checkout verification: verified. A fresh clone was started with `docker compose up --build -d` against an empty PostgreSQL instance. The application initialized the schema automatically, `/health/live` and `/health/ready` both returned 200, and the default burst completed with Overall: PASS.
+Clean-checkout verification: verified. A fresh clone was started with `docker compose up --build -d` against an empty PostgreSQL instance, with no manual migration command. The application created `shows`, `seats`, `reservations`, `reservation_seats`, `idempotency_keys`, and `user_show_counts`. `/health/live` and `/health/ready` both returned 200, and the default burst completed with Overall: PASS.
 
 The app reads environment variables from the process. It does not load a `.env` file. Compose injects the values below.
 
@@ -389,7 +393,7 @@ The harness fails the run unless:
 - replay and mismatch checks pass
 - sampled `GET /shows/{id}` counts satisfy `available + held + confirmed == total`
 
-Recorded results:
+Local results:
 
 | Run | Result |
 | --- | --- |
@@ -403,7 +407,7 @@ The 20,000-request command was:
 python burst/burst.py http://localhost:8000 --requests 20000 --concurrency 500 --setup-concurrency 25
 ```
 
-The harness reported FAIL because of 4 client-side `httpx.ReadError` transport failures. It did not report a server `5xx`. Observed on that local run:
+The harness reported FAIL because of 4 client-side `httpx.ReadError` transport failures. It did not report a server `5xx`. This was 20,000 attempts with at most 500 in flight, not 20,000 simultaneous requests, and it was not run on the public URL. Observed on that local run:
 
 - 20,000 mixed reservation attempts at concurrency 500
 - 0 timeouts
@@ -412,17 +416,51 @@ The harness reported FAIL because of 4 client-side `httpx.ReadError` transport f
 - server logs showed 19,996 `POST /reserve` requests reached the application
 - the other 4 never reached FastAPI and produced no application exception
 
-Those 4 losses are a local transport limit on Windows + Docker Desktop, not an application error response.
+The four failures occurred at the client/transport layer before reaching FastAPI and were observed on the local Windows + Docker Desktop networking path. They were not application error responses.
 
 ## Deployment
 
-Live URL: TODO
+Live URL: https://seat-reservation-paytm-production.up.railway.app
 
-Deployment platform: TODO
+Platform: Railway. One API replica, built from the existing Dockerfile. Railway sets `PORT`, and the image start command listens on it. The database is Railway PostgreSQL, connected with Railway's `DATABASE_URL`. On first boot the empty database received `migrations/001_init.sql` from the application startup path. No manual `psql` step was required.
 
-Public log access: TODO
+Railway healthcheck: `GET /health/ready`
 
-Local Compose is the documented run path. A public host still needs `DATABASE_URL`, `AUTH_SECRET`, `ADMIN_TOKEN`, and the single-worker container command above.
+Verified on the live URL:
+
+- `GET /health/live` returned `200` `{"status":"alive"}`
+- `GET /health/ready` returned `200` `{"status":"ready"}`
+- `GET /metrics` returned Prometheus metrics
+
+A public smoke reservation created show "Railway smoke test" with seats `A1`, `A2`, and `A3` at `price_paise` 25000. `POST /auth/token` minted a token for `smoke-user`. `A1` was reserved. The show then reported total 3, available 2, held 0, confirmed 1 (`3 = 2 + 0 + 1`). After that reservation, `reservations_confirmed_total` was 1 and `seats_available` for that show was 2.
+
+Structured deployment logs were verified in the Railway dashboard. There is no public log URL. Structured `request.completed` lines included timestamp, request id, method, path, status, duration, show id, user id, reservation id when applicable, and outcome (`confirmed`, `seat_taken`, `idempotency_mismatch`, and other `409` declines). They did not include `Authorization` headers, bearer tokens, `Idempotency-Key` values, or request bodies.
+
+Public burst results, run against the live URL. A mixed command also runs the hot-seat, per-user, replay, and mismatch probes before the mixed workload.
+
+Default:
+
+```bash
+python burst/burst.py https://seat-reservation-paytm-production.up.railway.app
+```
+
+PASS. Hot seat 20 attempts, 1 confirmed, 19 `seat_taken`, 0 `5xx`, 0 transport errors. Per-user 10 attempts, 4 confirmed, 6 `per_user_limit`, 0 `5xx`. Replay and mismatch both true. Reconciliation failures 0, invariant held.
+
+500 buyers, one seat:
+
+```bash
+python burst/burst.py https://seat-reservation-paytm-production.up.railway.app --hot-seat 500 --concurrency 500
+```
+
+PASS. 500 attempts, 1 confirmed, 499 `seat_taken`, 0 `5xx`, 0 transport errors. Per-user probe 4 confirmed, 6 `per_user_limit`, 0 `5xx`. Replay and mismatch both true. Reconciliation failures 0, invariant held.
+
+2,000 mixed requests:
+
+```bash
+python burst/burst.py https://seat-reservation-paytm-production.up.railway.app --requests 2000 --concurrency 200
+```
+
+PASS. The pre-checks matched the default run (1 hot-seat confirm and 19 `seat_taken`; 4 per-user confirms and 6 `per_user_limit`; replay and mismatch true; 0 `5xx` and 0 transport errors). The mixed section was 2,000 requests at concurrency 200: 1,398 confirmed, 100 replay, 396 `seat_taken`, 6 `per_user_limit`, 100 `idempotency_mismatch`, 0 other 4xx, 0 `5xx`, 0 timeouts, 0 transport errors, 66.535 seconds, 30.1 requests per second. Reconciliation during the run took 17 samples and 0 failures. Final counts were total 1,506, available 107, held 0, confirmed 1,399, invariant held. Metric deltas from this command include the hot-seat, per-user, replay, and mismatch probes as well as the 2,000 mixed requests.
 
 ## Repository history
 
